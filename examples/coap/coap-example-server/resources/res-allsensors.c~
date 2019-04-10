@@ -1,0 +1,190 @@
+/*
+ * Copyright (c) 2013, Institute for Pervasive Computing, ETH Zurich
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the Institute nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * This file is part of the Contiki operating system.
+ */
+
+/**
+ * \file
+ *      Example resource
+ * \author
+ *      Matthias Kovatsch <kovatsch@inf.ethz.ch>
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include "coap-engine.h"
+#include "dev/dht22.h"
+#include "random.h"
+#include "dev/leds.h"
+#include "power-mgmt.h"
+#include "contiki.h"
+#include "sys/etimer.h"
+#include "sys/rtimer.h"
+#include "dev/adc-zoul.h"
+#include "dev/zoul-sensors.h"
+#include "lib/random.h"
+#include "dev/serial-line.h"
+#include <stdio.h>
+#include <stdint.h>
+/*---------------------------------------------------------------------------*/
+#define LOOP_PERIOD         60
+#define LOOP_INTERVAL       (CLOCK_SECOND * LOOP_PERIOD)
+#define LEDS_PERIODIC       LEDS_GREEN
+#define BUTTON_PRESS_EVENT_INTERVAL (CLOCK_SECOND)
+/*---------------------------------------------------------------------------*/
+/* Log configuration */
+#include "sys/log.h"
+#define LOG_MODULE "SENSORS LOG"
+#define LOG_LEVEL LOG_LEVEL_INFO
+
+#include "sys/clock.h"
+#include "sys/rtimer.h"
+
+static void res_get_handler(coap_message_t *request, coap_message_t *response, uint8_t *buffer, uint16_t preferred_size, int32_t *offset);
+
+/*
+ * A handler function named [resource name]_handler must be implemented for each RESOURCE.
+ * A buffer for the response payload is provided through the buffer pointer. Simple resources can ignore
+ * preferred_size and offset, but must respect the REST_MAX_CHUNK_SIZE limit for the buffer.
+ * If a smaller block size is requested for CoAP, the REST framework automatically splits the data.
+ */
+RESOURCE(res_allsensors,
+         "title=\"ALLSENSORS: ?len=0..\";rt=\"Text\"",
+         res_get_handler,
+         NULL,
+         NULL,
+         NULL);
+
+static void
+res_get_handler(coap_message_t *request, coap_message_t *response, uint8_t *buffer, uint16_t preferred_size, int32_t *offset)
+{
+leds_off(LEDS_ALL);
+leds_toggle(LEDS_GREEN);
+static uint16_t voltage;
+int aux = 0;
+int aux2 = 0;
+float aux3 = 0;
+int value = 0;
+float xpto = 0;
+int16_t temperature = 0, humidity = 0, diox = 0;
+
+// Read the battery voltage level 
+if(pm_get_voltage(&voltage) != PM_SUCCESS) {
+  LOG_INFO("PM: error retrieving voltage\n");
+  voltage = 0;
+}
+
+LOG_INFO("PM: Voltage (raw) = %u\n", voltage);
+xpto = (float)voltage;
+// 5v      - 1024 
+// x       - adc raw
+aux3 = 5 * xpto;
+aux3 = aux3 / 1024;
+aux = (int)(aux3*10) / 10;
+aux2 = (int)(aux3*100) % 10;
+
+int battery = aux;
+int battery2 = aux2;
+// AC voltage value, with applied corresponding sensor algorithm
+LOG_INFO("AC voltage = %d V // Battery voltage value = %d.%d v\n", voltage, battery, battery2);
+
+battery = vdd3_sensor.value(CC2538_SENSORS_VALUE_TYPE_CONVERTED);
+
+LOG_INFO("Battery value = %d mV\n", battery);
+
+xpto = 0;
+value = 0;
+voltage = 0;
+aux = 0;
+
+voltage = adc_zoul.value(ZOUL_SENSORS_ADC3);
+// 27980 (max registado)   -  5 v
+// voltage                 -  x v
+xpto = (float)voltage * 5;
+xpto = xpto / 27980;
+// 4v      - 2000 ppm
+// voltage - x ppm
+aux = ((2000 *  xpto) / 4);
+value = (int)aux;
+// AC voltage value, with applied corresponding sensor algorithm
+LOG_INFO("AC voltage = %d V // CO2 value = %d ppm\n", voltage, value);
+diox = value;
+
+voltage = 0;
+xpto = 0;
+value = 0;
+aux = 0;
+aux2 = 0;
+
+voltage = adc_zoul.value(ZOUL_SENSORS_ADC2);
+// 18824 (max registado)   -  3.3 v
+// voltage                 -  x v
+xpto = (float)voltage * 3.3;
+xpto = xpto / 18824;
+//Cx = 1/M x (Vgas - Vgas0)
+//M = SensivityCode x TIAGain x 10^-9 x 10^3
+//M = 3,67 x 100 x 10^-9 x 10^3 = 0.000367 x 1000
+//Vgas0 = Vref + Voffset
+//xpto = ((float)voltage * 5) / 1024;
+value = (1 / 0.367) * (xpto - 1.64);
+if(value > 10){
+    aux = (int)(value*1000) / 100;
+    aux2 = (int)(value*1000) % 100;
+    if(aux2 < 0){
+      aux2 = aux2 * (-1);
+      aux = aux * (-1);
+    }
+}else{
+    aux = (int)(value*100) / 100;
+    aux2 = (int)(value*100) % 100;
+    if(aux2 < 0){
+        aux2 = aux2 * (-1);
+        aux = aux * (-1);
+    }
+}
+//AC voltage value, with applied corresponding sensor algorithm
+LOG_INFO("AC voltage = %d V // CO value = %d.%d ppm\n", voltage, aux, aux2);
+
+dht22_read_all(&temperature, &humidity);
+
+/* Some data that has the length up to REST_MAX_CHUNK_SIZE. For more, see the chunk resource. */
+snprintf((char *)buffer, REST_MAX_CHUNK_SIZE,"{'temp':'%02d.%02d','humi':'%02d.%02d','mono':'%d.%d','diox':'%d','batt':'%d'}", temperature / 10, temperature % 10, humidity / 10, humidity % 10, aux, aux2, diox, battery);
+LOG_INFO("{'temp':'%02d.%02d','humi':'%02d.%02d','mono':'%d.%d','diox':'%d','bat':'%d.%d'}\n", temperature / 10, temperature % 10, humidity / 10, humidity % 10, aux, aux2, diox, battery, battery2);
+/* The query string can be retrieved by rest_get_query() or parsed for its key-value pairs. */
+int length=strlen((char *)buffer);
+
+//  coap_set_header_content_format(response, TEXT_PLAIN); /* text/plain is the default, hence this option could be omitted. */
+coap_set_header_content_format(response, APPLICATION_JSON); /* text/plain is the default, hence this option could be omitted. */
+  coap_set_header_etag(response, (uint8_t *)&length, 1);
+  coap_set_payload(response, buffer, length);
+  leds_off(LEDS_ALL);
+  leds_toggle(LEDS_BLUE);
+}
+
+

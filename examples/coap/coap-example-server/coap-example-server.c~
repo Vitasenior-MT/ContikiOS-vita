@@ -1,0 +1,603 @@
+/*
+ * Copyright (c) 2013, Institute for Pervasive Computing, ETH Zurich
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the Institute nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * This file is part of the Contiki operating system.
+ */
+
+/**
+ * \file
+ *      Erbium (Er) CoAP Engine example.
+ * \author
+ *      Matthias Kovatsch <kovatsch@inf.ethz.ch>
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "contiki.h"
+#include "coap-engine.h"
+#include "power-mgmt.h"
+#if PLATFORM_SUPPORTS_BUTTON_HAL
+#include "dev/button-hal.h"
+#else
+#include "dev/button-sensor.h"
+#endif
+#include "dev/leds.h"
+#include "dev/adc-zoul.h"
+#include "dev/zoul-sensors.h"
+#include "net/routing/routing.h"
+#include "net/netstack.h"
+#include "net/ipv6/simple-udp.h"
+#include "net/ipv6/uip-ds6.h"
+#include "arch/cpu/cc2538/dev/cc2538-rf.h"
+#include "rtcc.h"
+#include "dev/i2c.h"
+
+/* Log configuration */
+#include "sys/log.h"
+#define LOG_MODULE "COAP"
+#define LOG_LEVEL LOG_LEVEL_INFO
+/*---------------------------------------------------------------------------*/
+#define WITH_SERVER_REPLY  0
+#define UDP_CLIENT_PORT	8002
+#define UDP_SERVER_PORT 10000
+
+#define battery_threshold_max 4000
+#define battery_threshold_min 0
+#define temp_threshold_max 27
+#define temp_threshold_min 19
+#define humi_threshold_max 70
+#define humi_threshold_min 30
+#define mono_threshold_max 9
+#define diox_threshold_max 1250
+
+static struct simple_udp_connection udp_conn;
+uip_ipaddr_t server_ipaddr;
+/*---------------------------------------------------------------------------*/
+#define LOOP_PERIOD             30
+#define LOOP_INTERVAL           (CLOCK_SECOND * LOOP_PERIOD)
+#define TEST_ALARM_SECOND       180
+/*---------------------------------------------------------------------------*/
+#define ADC_SENSORS_CONF_ADC3_PIN     2             /**< Hard-coded to PA2    */
+#define ADC_SENSORS_CONF_ADC2_PIN     4             /**< Hard-coded to PA4    */
+/*---------------------------------------------------------------------------*/
+static uint8_t rtc_buffer[sizeof(simple_td_map)];
+static simple_td_map *simple_td = (simple_td_map *)rtc_buffer;
+/*---------------------------------------------------------------------------*/
+bool sensor_read = false;
+static struct etimer et;
+static struct etimer et2;
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/* Enable to match a given second number every minute, else it will trigger an
+ * interrupt every TEST_ALARM_SECOND
+ */
+#define TEST_ALARM_MATCH_MIN    0
+/*---------------------------------------------------------------------------*/
+void
+configure_new_alarm(void)
+{
+  if(rtcc_date_increment_seconds(simple_td, TEST_ALARM_SECOND) == AB08_ERROR) {
+    LOG_INFO("Fail: could not increment the next alarm date\n");
+    return;
+  }
+
+  /* We use the RTCC_REPEAT_DAY as we want the RTCC to match the given date */
+  if(rtcc_set_alarm_time_date(simple_td, RTCC_ALARM_ON, RTCC_REPEAT_DAY,
+                              RTCC_TRIGGER_INT1) == AB08_ERROR) {
+    LOG_INFO("Fail: couldn't set the alarm\n");
+    return;
+  }
+
+  LOG_INFO("Alarm set to match: ");
+  rtcc_print(RTCC_PRINT_ALARM_DEC);
+}
+/*---------------------------------------------------------------------------*/
+void
+rtcc_interrupt_callback(uint8_t value)
+{
+  LOG_INFO("A RTCC interrupt just happened! time/date: ");
+  rtcc_print(RTCC_PRINT_DATE_DEC);
+  leds_toggle(LEDS_ALL);
+   /* If we are off, turn on */
+  if((REG(RFCORE_XREG_FSMSTAT0) & RFCORE_XREG_FSMSTAT0_FSM_FFCTRL_STATE) == 0) {
+    	LOG_INFO("READ ON time: ");
+  		rtcc_print(RTCC_PRINT_DATE_DEC);
+    	on();
+    	/* Configure the RTCC to trigger an alarm every TEST_ALARM_SECOND tick */
+  		LOG_INFO("Setting an alarm to tick every %u seconds\n", CLOCK_SECOND*90);
+		configure_new_alarm();
+  }else {
+  	LOG_INFO("OFF time: ");
+  rtcc_print(RTCC_PRINT_DATE_DEC);
+  	off();
+  	/* Configure the RTCC to trigger an alarm every TEST_ALARM_SECOND tick */
+  LOG_INFO("Setting an alarm to tick every %u seconds\n", TEST_ALARM_SECOND);
+
+  configure_new_alarm();
+  }
+
+#if !TEST_ALARM_MATCH_MIN
+  configure_new_alarm();
+#endif
+}
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+static void
+udp_rx_callback(struct simple_udp_connection *c,
+         const uip_ipaddr_t *sender_addr,
+         uint16_t sender_port,
+         const uip_ipaddr_t *receiver_addr,
+         uint16_t receiver_port,
+         const uint8_t *data,
+         uint16_t datalen)
+{
+  unsigned count = *(unsigned *)data;
+  /* If tagging of traffic class is enabled tc will print number of
+     transmission - otherwise it will be 0 */
+  LOG_INFO("Received response %u (tc:%d) from ", count, uipbuf_get_attr(UIPBUF_ATTR_MAX_MAC_TRANSMISSIONS));
+  LOG_INFO_6ADDR(sender_addr);
+  LOG_INFO_("\n");
+}
+/*---------------------------------------------------------------------------*/
+static void
+set_global_address(void)
+{
+  uip_ipaddr_t ipaddr;
+  uip_ip6addr(&ipaddr, 0xfd00, 0, 0, 0, 0, 0, 0, 0);
+  uip_ds6_set_addr_iid(&ipaddr, &uip_lladdr);
+  uip_ds6_addr_add(&ipaddr, 0, ADDR_AUTOCONF);
+  uip_ip6addr(&server_ipaddr, 0xfd00, 0, 0, 0, 0, 0, 0, 1);
+}
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/*
+ * Resources to be activated need to be imported through the extern keyword.
+ * The build system automatically compiles the resources in the corresponding sub-directory.
+ */
+extern coap_resource_t
+  res_chunks,
+  res_separate,
+  res_push,
+  res_event,
+  res_sub,
+  res_b1_sep_b2;
+
+#include "dev/dht22.h"
+extern coap_resource_t res_dht22;
+
+extern coap_resource_t res_mono;
+
+extern coap_resource_t res_allsensors;
+/*
+#if PLATFORM_HAS_LEDS
+extern coap_resource_t res_leds, res_toggle;
+#endif
+#if PLATFORM_HAS_LIGHT
+#include "dev/light-sensor.h"
+extern coap_resource_t res_light;
+#endif
+#if PLATFORM_HAS_BATTERY
+#include "dev/battery-sensor.h"
+extern coap_resource_t res_battery;
+#endif
+#if PLATFORM_HAS_TEMPERATURE
+#include "dev/temperature-sensor.h"
+extern coap_resource_t res_temperature;
+#endif
+*/
+PROCESS(er_example_server, "Erbium Example Server");
+AUTOSTART_PROCESSES(&er_example_server);
+
+PROCESS_THREAD(er_example_server, ev, data)
+{
+	static int seq_id = 0;
+  static int counter = 0;
+  static int temperature_total, humidity_total, mono_total, diox_total;
+  float temperature_value, humidity_value, mono_value, diox_value;
+  static int temp_average[] = {0,0,0,0,0};
+  static int humi_average[] = {0,0,0,0,0};
+  static int mono_average[] = {0,0,0,0,0};
+  static int diox_average[] = {0,0,0,0,0};
+  char warningbuff[50];
+  PROCESS_BEGIN();
+	simple_udp_register(&udp_conn, UDP_CLIENT_PORT, NULL, UDP_SERVER_PORT, udp_rx_callback);
+  set_global_address();
+  etimer_set(&et2, (CLOCK_SECOND * 60));
+  /* Map interrupt callback handler */
+  RTCC_REGISTER_INT1(rtcc_interrupt_callback);
+  /* Wait a bit */
+  etimer_set(&et, (CLOCK_SECOND * 2));
+  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+  /* Retrieve the configured time and date, this doesn't overwrites the
+   * mode and century values
+   */
+  if(rtcc_get_time_date(simple_td) == AB08_ERROR) {
+    LOG_INFO("Fail: Couldn't read time and date\n");
+    PROCESS_EXIT();
+  }
+
+  /* ...or for visualization only, just print the date directly from the RTCC */
+  LOG_INFO("Configured time: ");
+  rtcc_print(RTCC_PRINT_DATE_DEC);
+  
+#if TEST_ALARM_MATCH_MIN
+  /* Configure the RTCC to trigger an alarm every TEST_ALARM_SECOND match */
+  LOG_INFO("Setting an alarm to tick every %u seconds match\n", TEST_ALARM_SECOND);
+
+  simple_td->seconds = TEST_ALARM_SECOND;
+
+  /* Notice the arguments, we want to trigger the alarm every time the clock
+   * matches the seconds values, so the alarm would have to be repeated every
+   * minute.  In case we would want to trigger the alarm on a specific time,
+   * then we would want to set a daily repeat interval
+   */
+  if(rtcc_set_alarm_time_date(simple_td, RTCC_ALARM_ON, RTCC_REPEAT_MINUTE,
+                              RTCC_TRIGGER_INT1) == AB08_ERROR) {
+    LOG_INFO("Fail: couldn't set the alarm\n");
+    PROCESS_EXIT();
+  }
+
+#else
+  /* Configure the RTCC to trigger an alarm every TEST_ALARM_SECOND tick */
+  LOG_INFO("Setting an alarm to tick every %u seconds\n", TEST_ALARM_SECOND);
+
+  configure_new_alarm();
+#endif
+
+  PROCESS_PAUSE();
+
+  LOG_INFO("Starting COAP Server\n");
+  /* Initialize the power management block and signal the low-power PIC */
+  if(pm_enable() != PM_SUCCESS) {
+    LOG_INFO("PM: Failed to initialize\n");
+  }
+  LOG_INFO("PM: enabled!\n");
+	
+  /* Configure the ADC ports */
+  //CO Sensor
+  adc_zoul.configure(SENSORS_HW_INIT, ZOUL_SENSORS_ADC2);
+  //CO2 Sensor
+  adc_zoul.configure(SENSORS_HW_INIT, ZOUL_SENSORS_ADC3);
+  //Sensor voltagem bateria
+  SENSORS_ACTIVATE(vdd3_sensor);
+  //Sensor temperatura e humidade
+  SENSORS_ACTIVATE(dht22);
+  /*
+   * Bind the resources to their Uri-Path.
+   * WARNING: Activating twice only means alternate path, not two instances!
+   * All static variables are the same for each URI path.
+   */
+   /*
+  coap_activate_resource(&res_chunks, "test/chunks");
+  coap_activate_resource(&res_separate, "test/separate");
+  coap_activate_resource(&res_push, "test/push");
+#if PLATFORM_HAS_BUTTON
+  coap_activate_resource(&res_event, "sensors/button");
+#endif PLATFORM_HAS_BUTTON 
+  coap_activate_resource(&res_sub, "test/sub");
+  coap_activate_resource(&res_b1_sep_b2, "test/b1sepb2");
+#if PLATFORM_HAS_LEDS
+//  coap_activate_resource(&res_leds, "actuators/leds"); 
+  coap_activate_resource(&res_toggle, "actuators/toggle");
+#endif
+#if PLATFORM_HAS_LIGHT
+  coap_activate_resource(&res_light, "sensors/light");
+  SENSORS_ACTIVATE(light_sensor);
+#endif
+#if PLATFORM_HAS_BATTERY
+  coap_activate_resource(&res_battery, "sensors/battery");
+  SENSORS_ACTIVATE(battery_sensor);
+#endif
+#if PLATFORM_HAS_TEMPERATURE
+  coap_activate_resource(&res_temperature, "sensors/temperature");
+  SENSORS_ACTIVATE(temperature_sensor);
+#endif
+*/
+//coap_activate_resource(&res_dht22, "sensors/dht22");
+  
+//coap_activate_resource(&res_mono, "sensors/mono");
+
+coap_activate_resource(&res_allsensors, "sensors/allsensors");
+
+	/* Wait a bit */
+  etimer_set(&et, (CLOCK_SECOND*60));
+  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+  LOG_INFO("Turning Radio Off--- \n");
+  off();
+  /* Define application-specific events here. */
+  while(1) {
+  	LOG_INFO("Counter value --- %d   \n", counter);
+    seq_id++;
+    static uint16_t voltage;
+	int aux = 0;
+	int aux2 = 0;
+	float aux3 = 0;
+	int value = 0;
+	float xpto = 0;
+	int16_t temperature = 0, humidity = 0, diox = 0, mono = 0;
+	
+	// Read the battery voltage level 
+	if(pm_get_voltage(&voltage) != PM_SUCCESS) {
+	  LOG_INFO("PM: error retrieving voltage\n");
+	  voltage = 0;
+	}
+	
+	LOG_INFO("PM: Voltage (raw) = %u\n", voltage);
+	xpto = (float)voltage;
+	// 5v      - 1024 
+	// x       - adc raw
+	aux3 = 5 * xpto;
+	aux3 = aux3 / 1024;
+	aux = (int)(aux3*10) / 10;
+	aux2 = (int)(aux3*100) % 10;
+	
+	int battery = aux;
+	int battery2 = aux2;
+	// AC voltage value, with applied corresponding sensor algorithm
+	LOG_INFO("AC voltage = %d V // Battery voltage value = %d.%d v\n", voltage, battery, battery2);
+	
+	battery = vdd3_sensor.value(CC2538_SENSORS_VALUE_TYPE_CONVERTED);
+	
+	LOG_INFO("Battery value = %d mV\n", battery);
+	
+	xpto = 0;
+	value = 0;
+	voltage = 0;
+	aux = 0;
+	
+	voltage = adc_zoul.value(ZOUL_SENSORS_ADC3);
+	// 27980 (max registado)   -  5 v
+	// voltage                 -  x v
+	xpto = (float)voltage * 5;
+	xpto = xpto / 27980;
+	// 4v      - 2000 ppm
+	// voltage - x ppm
+	aux = ((2000 *  xpto) / 4);
+	value = (int)aux;
+	// AC voltage value, with applied corresponding sensor algorithm
+	LOG_INFO("AC voltage = %d V // CO2 value = %d ppm\n", voltage, value);
+	diox = value;
+	
+	voltage = 0;
+	xpto = 0;
+	value = 0;
+	aux = 0;
+	aux2 = 0;
+	
+	voltage = adc_zoul.value(ZOUL_SENSORS_ADC2);
+	// 18824 (max registado)   -  3.3 v
+	// voltage                 -  x v
+	xpto = (float)voltage * 3.3;
+	xpto = xpto / 18824;
+	//Cx = 1/M x (Vgas - Vgas0)
+	//M = SensivityCode x TIAGain x 10^-9 x 10^3
+	//M = 3,67 x 100 x 10^-9 x 10^3 = 0.000367 x 1000
+	//Vgas0 = Vref + Voffset
+	//xpto = ((float)voltage * 5) / 1024;
+	value = (1 / 0.367) * (xpto - 1.64);
+	if(value > 10){
+	    aux = (int)(value*1000) / 100;
+	    aux2 = (int)(value*1000) % 100;
+	    if(aux2 < 0){
+	      aux2 = aux2 * (-1);
+	      aux = aux * (-1);
+	    }
+	}else{
+	    aux = (int)(value*100) / 100;
+	    aux2 = (int)(value*100) % 100;
+	    if(aux2 < 0){
+	        aux2 = aux2 * (-1);
+	        aux = aux * (-1);
+	    }
+	}
+	//AC voltage value, with applied corresponding sensor algorithm
+	LOG_INFO("AC voltage = %d V // CO value = %d.%d ppm\n", voltage, aux, aux2);
+	mono = aux;	
+	mono = aux2 * 0.1;
+	
+	dht22_read_all(&temperature, &humidity);
+    temperature_total += temperature;
+    humidity_total += humidity;
+    mono_total += mono;
+    diox_total += diox;
+    if(counter > 5){
+      temp_average[0] = temp_average[1];
+      temp_average[1] = temp_average[2];
+      temp_average[2] = temp_average[3];
+      temp_average[3] = temp_average[4];
+      temp_average[4] = temperature;
+      temperature_value = ((float)temp_average[0] + (float)temp_average[1] + (float)temp_average[2] + (float)temp_average[3] + (float)temp_average[4]) / 5;
+      temperature = (int)temperature_value;
+      //LOG_INFO("Temp value --- %d     to \n", temperature);
+
+      humi_average[0] = humi_average[1];
+      humi_average[1] = humi_average[2];
+      humi_average[2] = humi_average[3];
+      humi_average[3] = humi_average[4];
+      humi_average[4] = humidity;
+      humidity_value = ((float)humi_average[0] + (float)humi_average[1] + (float)humi_average[2] + (float)humi_average[3] + (float)humi_average[4]) / 5;
+      humidity = (int)humidity_value;
+      //LOG_INFO("Humi value --- %d     to \n", humidity);
+
+      mono_average[0] = mono_average[1];
+      mono_average[1] = mono_average[2];
+      mono_average[2] = mono_average[3];
+      mono_average[3] = mono_average[4];
+      mono_average[4] = mono;
+      mono_value = ((float)mono_average[0] + (float)mono_average[1] + (float)mono_average[2] + (float)mono_average[3] + (float)mono_average[4]) / 5;
+      mono = (int)mono_value;
+      //LOG_INFO("Mono value --- %d     to \n", mono);
+
+      diox_average[0] = diox_average[1];
+      diox_average[1] = diox_average[2];
+      diox_average[2] = diox_average[3];
+      diox_average[3] = diox_average[4];
+      diox_average[4] = diox;
+      diox_value = ((float)diox_average[0] + (float)diox_average[1] + (float)diox_average[2] + (float)diox_average[3] + (float)diox_average[4]) / 5;
+      diox = (int)diox_value;
+      //LOG_INFO("diox value --- %d     to \n", diox);
+    	if (battery> battery_threshold_max || battery < battery_threshold_min){
+        if(NETSTACK_ROUTING.node_is_reachable()) {
+        	on();
+          sprintf(warningbuff, "{'WARNING':{'cont':'%d','batt':'%d'}}#", seq_id, battery);
+          LOG_INFO_("\n ");
+          LOG_INFO("Sending WARNING BATTERY --- %s     to ", warningbuff);
+          LOG_INFO_6ADDR(&server_ipaddr);
+          LOG_INFO_("\n");
+          uipbuf_set_attr(UIPBUF_ATTR_MAX_MAC_TRANSMISSIONS, 3);
+          	/* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          simple_udp_sendto(&udp_conn, &warningbuff, sizeof(warningbuff), &server_ipaddr);
+          /* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          off();
+        } else {
+          LOG_INFO("Not reachable yet\n");
+        }
+      LOG_INFO(" ------------------------------------------------------ \n");
+      }
+      if ((temperature/10) > temp_threshold_max || (temperature/10) < temp_threshold_min){
+        if(NETSTACK_ROUTING.node_is_reachable()) {
+        	on();
+          sprintf(warningbuff, "{'WARNING':{'cont':'%d','temp':'%02d.%02d'}}#", seq_id, temperature / 10, temperature % 10);
+          LOG_INFO_("\n ");
+          LOG_INFO("Sending WARNING TEMP --- %s     to ", warningbuff);
+          LOG_INFO_6ADDR(&server_ipaddr);
+          LOG_INFO_("\n");
+          uipbuf_set_attr(UIPBUF_ATTR_MAX_MAC_TRANSMISSIONS, 3);
+          	/* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          simple_udp_sendto(&udp_conn, &warningbuff, sizeof(warningbuff), &server_ipaddr);
+          /* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          off();
+        } else {
+          LOG_INFO("Not reachable yet\n");
+        }
+      LOG_INFO(" ------------------------------------------------------ \n");
+      }
+      if ((humidity/10) > humi_threshold_max || (humidity/10) < humi_threshold_min){
+        if(NETSTACK_ROUTING.node_is_reachable()) {
+        	on();
+          sprintf(warningbuff, "{'WARNING':{'cont':'%d','humi':'%02d.%02d'}}#", seq_id, humidity / 10, humidity % 10);
+          LOG_INFO_("\n ");
+          LOG_INFO("Sending WARNING HUMI --- %s     to ", warningbuff);
+          LOG_INFO_6ADDR(&server_ipaddr);
+          LOG_INFO_("\n");
+          	/* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          simple_udp_sendto(&udp_conn, &warningbuff, sizeof(warningbuff), &server_ipaddr);
+          /* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          off();
+        } else {
+          LOG_INFO("Not reachable yet\n");
+        }
+      LOG_INFO(" ------------------------------------------------------ \n");
+      }
+      if (mono > mono_threshold_max){
+        if(NETSTACK_ROUTING.node_is_reachable()) {
+        	on();
+          sprintf(warningbuff, "{'WARNING':{'cont':'%d','mono':'0%d'}}#", seq_id, mono);
+          LOG_INFO_("\n ");
+          LOG_INFO("Sending WARNING MONOXIDE --- %s     to ", warningbuff);
+          LOG_INFO_6ADDR(&server_ipaddr);
+          LOG_INFO_("\n");
+          	/* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          simple_udp_sendto(&udp_conn, &warningbuff, sizeof(warningbuff), &server_ipaddr);
+          /* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          off();
+        } else {
+          LOG_INFO("Not reachable yet\n");
+        }
+      LOG_INFO(" ------------------------------------------------------ \n");
+      }
+      if (diox > diox_threshold_max){
+        if(NETSTACK_ROUTING.node_is_reachable()) {
+        	on();
+          sprintf(warningbuff, "{'WARNING':{'cont':'%d','diox':'0%d'}}#", seq_id, diox);
+          LOG_INFO_("\n ");
+          LOG_INFO("Sending WARNING dioxDE --- %s     to ", warningbuff);
+          LOG_INFO_6ADDR(&server_ipaddr);
+          LOG_INFO_("\n");
+          	/* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          simple_udp_sendto(&udp_conn, &warningbuff, sizeof(warningbuff), &server_ipaddr);
+          /* Wait a bit */
+			  etimer_set(&et, (CLOCK_SECOND * 2));
+			  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+          off();
+        } else {
+          LOG_INFO("Not reachable yet\n");
+        }
+      LOG_INFO(" ------------------------------------------------------ \n");
+      }
+    }
+    if(counter > 14){
+      counter = 0;
+      temperature_total = 0;
+      humidity_total = 0;
+      mono_total = 0;
+      diox_total= 0;
+    LOG_INFO(" ------------------------------------------------------ \n");
+    }
+    counter++;
+    etimer_set(&et2, (CLOCK_SECOND * 60));
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et2));
+#if PLATFORM_HAS_BUTTON
+#if PLATFORM_SUPPORTS_BUTTON_HAL
+    if(ev == button_hal_release_event) {
+#else
+    if(ev == sensors_event && data == &button_sensor) {
+#endif
+      LOG_DBG("*******BUTTON*******\n");
+
+      /* Call the event_handler for this application-specific event. */
+      res_event.trigger();
+
+      /* Also call the separate response example handler. */
+      res_separate.resume();
+      sensor_read = true;
+    }
+#endif /* PLATFORM_HAS_BUTTON */
+  }                             /* while (1) */
+
+  PROCESS_END();
+}
